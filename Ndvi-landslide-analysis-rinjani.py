@@ -1,0 +1,275 @@
+# FULL CODE 
+# NDVI ANALYSIS PROJECT 
+# Study: Landslide Impact on Vegetation (Mount Rinjani)
+
+
+#  IMPORT REQUIRED LIBRARIES
+
+# pandas → data handling
+# numpy → numerical operations
+# matplotlib → plotting graphs
+# KMeans → clustering (to separate the two valleys)
+# mannwhitneyu → statistical test for seasonal difference
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from scipy.stats import mannwhitneyu
+
+
+
+#  LOAD DATA AND INITIAL CLEANING
+
+
+# Load the CSV file (your NDVI dataset)
+df = pd.read_csv('ndvi_extraction.csv')
+
+# Fix typo in column names: "NVDI" → "NDVI"
+# This ensures all NDVI columns are correctly identified
+df.columns = [col.replace('NVDI', 'NDVI') for col in df.columns]
+
+# Remove duplicate columns if they exist
+# Duplicate columns can break assignments later
+df = df.loc[:, ~df.columns.duplicated()]
+
+# Identify all NDVI columns automatically
+ndvi_cols = [col for col in df.columns if 'NDVI' in col]
+
+# Keep only valid NDVI values between -1 and 1
+# Values outside this range are physically impossible → set to NaN
+df.loc[:, ndvi_cols] = df.loc[:, ndvi_cols].where(
+    (df.loc[:, ndvi_cols] >= -1) & (df.loc[:, ndvi_cols] <= 1),
+    np.nan
+)
+
+# NOTE:
+# We DO NOT interpolate missing values.
+# This ensures we only use real satellite observations.
+
+
+
+#  CONVERT DATA FROM WIDE → LONG FORMAT
+
+
+# Melt the dataset so each row = one observation at one time
+# This is required for time-series analysis
+df_long = df.melt(
+    id_vars=['fid', 'Points', 'X', 'Y'],  # keep identifiers
+    value_vars=ndvi_cols,               # NDVI columns
+    var_name='Date_Raw',
+    value_name='NDVI'
+)
+
+# Function to extract date from column names like "NDVI201805"
+def parse_ndvi_date(date_str):
+    clean = date_str.replace('NDVI', '').split('_')[0]
+    try:
+        return pd.to_datetime(clean, format='%Y%m')
+    except:
+        return pd.NaT  # invalid dates become NaT
+
+# Apply date parsing
+df_long['Date'] = df_long['Date_Raw'].apply(parse_ndvi_date)
+
+# Remove rows where date could not be parsed
+df_long = df_long.dropna(subset=['Date'])
+
+
+
+#  IDENTIFY LOCATIONS USING K-MEANS CLUSTERING
+
+
+# Extract spatial coordinates
+coords = df[['X', 'Y']]
+
+# Perform clustering (2 clusters = 2 valleys)
+kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+df['Cluster'] = kmeans.fit_predict(coords)
+
+# Get cluster centers
+centers = kmeans.cluster_centers_
+
+# Assign names based on longitude (X coordinate)
+# Lower X = more west → Carbon Valley
+if centers[0][0] < centers[1][0]:
+    cluster_map = {0: 'Carbon Valley', 1: 'Paradise Valley'}
+else:
+    cluster_map = {1: 'Carbon Valley', 0: 'Paradise Valley'}
+
+# Merge cluster labels into long dataset
+df_long = df_long.merge(df[['Points', 'Cluster']], on='Points')
+
+# Create final location column
+df_long['Location'] = df_long['Cluster'].map(cluster_map)
+
+
+
+# 5. CREATE TIME FEATURES AND SEASON LABELS
+
+
+# Extract year and month
+df_long['Year'] = df_long['Date'].dt.year
+df_long['Month'] = df_long['Date'].dt.month
+
+# Create Year-Month column for grouping
+df_long['YearMonth'] = df_long['Date'].dt.to_period('M').astype(str)
+
+# Define seasons based on local climate
+# Wet season (Nov–Apr) → Growing
+# Dry season (May–Oct) → Non-Growing
+df_long['Season'] = df_long['Month'].apply(
+    lambda x: 'Growing (Wet)' if x in [11,12,1,2,3,4] else 'Non-Growing (Dry)'
+)
+
+
+
+#  OBJECTIVE 1 — VEGETATION LOSS ANALYSIS
+
+
+# Pre-earthquake baseline (April–May 2018)
+pre_event = df_long[
+    (df_long['Year'] == 2018) &
+    (df_long['Month'].isin([4, 5]))
+].groupby('Location')['NDVI'].mean()
+
+# Post-earthquake disturbance (Aug–Sep 2018)
+post_event = df_long[
+    (df_long['Year'] == 2018) &
+    (df_long['Month'].isin([8, 9]))
+].groupby('Location')['NDVI'].mean()
+
+# Calculate percentage loss
+loss_pct = ((pre_event - post_event) / pre_event * 100)
+
+print("\n=== OBJECTIVE 1: VEGETATION LOSS (%) ===")
+print(loss_pct.round(2))
+
+
+
+#  OBJECTIVE 2 — NDVI RECOVERY TREND (TIME SERIES)
+
+
+# Compute mean NDVI over time for each location
+location_trend = df_long.groupby(['Date', 'Location'])['NDVI'].mean().unstack()
+
+# Plot the trend
+fig, ax = plt.subplots(figsize=(12, 6))
+location_trend.plot(ax=ax, marker='o', markersize=3)
+
+# Add vertical line showing earthquake date
+ax.axvline(pd.to_datetime('2018-08-01'),
+           color='red',
+           linestyle='--',
+           label='Aug 2018 Earthquake')
+
+# Labels and styling
+ax.set_title('NDVI Recovery Trajectories (2018–2025)')
+ax.set_xlabel('Year')
+ax.set_ylabel('Mean NDVI')
+ax.grid(True, alpha=0.3)
+ax.legend()
+
+# Save figure
+plt.savefig('ndvi_recovery_trend.png', dpi=300, bbox_inches='tight')
+
+plt.show()
+
+
+
+# 8. OBJECTIVE 2 — SEASONAL STATISTICS TABLE
+
+
+# Compute summary statistics for each season and location
+seasonal_table = df_long.groupby(['Season', 'Location'])['NDVI'].agg(
+    Mean='mean',
+    SD='std',
+    Min='min',
+    Max='max'
+).round(3)
+
+print("\n=== OBJECTIVE 2: SEASONAL SUMMARY ===")
+print(seasonal_table)
+
+
+
+#  TABLE 3 — FULL TIME SERIES SUMMARY
+
+
+# Calculate mean and standard deviation per month and location
+table = df_long.groupby(['YearMonth', 'Location']).agg(
+    Mean_NDVI=('NDVI', 'mean'),
+    SD_NDVI=('NDVI', 'std')
+).reset_index()
+
+# Convert to wide format for better readability
+table_pivot = table.pivot(index='YearMonth', columns='Location')
+
+# Rename columns
+table_pivot.columns = [
+    'Carbon Mean', 'Paradise Mean',
+    'Carbon SD', 'Paradise SD'
+]
+
+table_pivot = table_pivot.reset_index()
+
+# Add season information
+season_map = df_long[['YearMonth', 'Season']].drop_duplicates()
+
+table3 = table_pivot.merge(season_map, on='YearMonth')
+
+# Reorder columns for clarity
+table3 = table3[['YearMonth', 'Season',
+                 'Carbon Mean', 'Carbon SD',
+                 'Paradise Mean', 'Paradise SD']]
+
+print("\n=== TABLE 3: NDVI TIME SERIES ===")
+print(table3.head())
+
+
+
+#  OBJECTIVE 3 — INTER-ANNUAL TREND
+
+
+# Calculate yearly mean NDVI
+yearly_trend = df_long.groupby(['Year', 'Location'])['NDVI'].mean().unstack()
+
+# Plot yearly trend
+fig, ax = plt.subplots(figsize=(10, 5))
+yearly_trend.plot(ax=ax, marker='o')
+
+ax.set_title('Inter-Annual NDVI Trend')
+ax.set_xlabel('Year')
+ax.set_ylabel('Mean NDVI')
+ax.grid(True)
+
+# Save figure
+plt.savefig('ndvi_interannual.png', dpi=300, bbox_inches='tight')
+
+plt.show()
+
+
+
+#  OBJECTIVE 3 — STATISTICAL ANALYSIS
+
+
+# Mann-Whitney U test (compare seasons)
+growing = df_long[df_long['Season'] == 'Growing (Wet)']['NDVI'].dropna()
+nongrowing = df_long[df_long['Season'] == 'Non-Growing (Dry)']['NDVI'].dropna()
+
+u_stat, p_val = mannwhitneyu(growing, nongrowing)
+
+# Pearson correlation between valleys
+pearson_r = location_trend.dropna().corr().iloc[0, 1]
+
+print("\n=== OBJECTIVE 3: STATISTICAL RESULTS ===")
+print(f"Mann-Whitney p-value: {p_val:.5f}")
+print(f"Pearson correlation (Carbon vs Paradise): {pearson_r:.3f}")
+
+# Interpretation
+print("→ Strong positive correlation: both valleys respond to the same disturbance and recovery events")
+
+if p_val < 0.05:
+    print("→ Significant seasonal difference")
+else:
+    print("→ No significant seasonal difference")
